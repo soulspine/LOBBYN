@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "LOBBYN": {
+      "commandName": "Project",
+      "workingDirectory": "C:\\code\\LOBBYN\\LOBBYN"
+    }
+  }
+}
