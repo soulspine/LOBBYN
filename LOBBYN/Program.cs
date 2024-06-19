@@ -14,7 +14,8 @@ namespace LOBBYN
                 Thread.Sleep(1000);
             }
 
-            await mainHandler.CreateLobby(mapId:MapType.HOWLING_ABYSS, pickType:PickType.BLIND, password:"DHUWADHUIAWDHUJAW");
+            Summoner summoner = await mainHandler.getSummoner("Hide on bush", "KR");
+            mainHandler.log($"Summoner: {summoner.displayName} - Level {summoner.summonerLevel}", false);
 
             while (mainHandler.isConnected)
             {

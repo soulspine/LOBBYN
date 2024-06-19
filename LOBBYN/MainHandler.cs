@@ -64,9 +64,31 @@ namespace LOBBYN
             }
         }
 
+        public async Task<List<Summoner>> getSummoners(List<Tuple<string,string>> tupList)
+        {
+            List<string> names = new List<string>();
+
+            foreach ((string name, string tagline) in tupList)
+            {
+                names.Add($"{name}#{tagline}");
+            }
+
+
+
+            string response =  await _lcu.Request(requestMethod.POST, "/lol-summoner/v2/summoners/names", JsonConvert.SerializeObject(names));
+            return JsonConvert.DeserializeObject<List<Summoner>>(response);
+        }
+
+        public async Task<Summoner?> getSummoner(string name, string tagline)
+        {
+            List<Tuple<string,string>> list = new List<Tuple<string, string>> { new Tuple<string, string>(name, tagline) };
+            List<Summoner> outList = await getSummoners(list);
+            if (outList.Count == 0) return null;
+            else return outList[0];
+        }
+
         public async Task CreateLobby(int mapId = MapType.SUMMONERS_RIFT, string lobbyName = "Lobbyn Custom Game", Int16 teamSize = 5, string password = "", string pickType = PickType.TOURNAMENT, string spectatorPolicy = SpectatorPolicy.ALL)
         {
-
             string gamemode;
             Int16 mutator;
 
@@ -136,6 +158,17 @@ namespace LOBBYN
             //log($"Created custom lobby - {lobbyName} - {gamemode}, map {mapId}, , team size {teamSize}, pick type {pickType}, spectator policy {spectatorPolicy}");
         }
 
+        public async Task InvitePlayers(string[] summonerNames)
+        {
+            object data = new
+            {
+                summonerNames = summonerNames,
+            };
+
+            string response = await _lcu.Request(requestMethod.POST, "/lol-lobby/v2/lobby/invitations", JsonConvert.SerializeObject(data));
+
+            logWithErrorCheck(response, $"Invited players to lobby", $"Failed to invite players to lobby");
+        }
 
         private void ChampSelectUpdate(OnWebsocketEventArgs obj)
         {

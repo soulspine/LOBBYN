@@ -5,6 +5,7 @@ This app will help League of Legends tournament organizers with managing said to
 Things completed:
 - Lobby creation
 - Champ select recording
+- Getting summoner profile info
 
 Things to do (Backend):
 - Tournament creation
