@@ -14,9 +14,9 @@ namespace LOBBYN
 {
     internal class MainHandler
     {
-        public bool isConnected => _lcu.IsConnected;
+        public bool isReady;
 
-        public LeagueClient _lcu = new LeagueClient(credentials.cmd);
+        public LeagueClient _lcu;
         private ConfigParser _config = new ConfigParser(File.ReadAllText("config.ini"));
 
         private bool _inChampSelect = false;
@@ -28,9 +28,25 @@ namespace LOBBYN
         public MainHandler()
         {
             _logfilePath = _config.GetValue("Logger", "logfile");
+
+            StartupChecker startupChecker = new StartupChecker();
+            isReady = startupChecker.IsLCUReady().Result;
+            
+            if (!isReady) log("Waiting for League of Legends to be ready...", false);
+            while (!isReady)
+            {
+                startupChecker = new StartupChecker();
+                isReady = startupChecker.IsLCUReady().Result;
+                Thread.Sleep(2000);
+            }
+
+            _lcu = new LeagueClient(credentials.cmd);
+
             _lcu.Subscribe("/lol-champ-select/v1/session", ChampSelectUpdate);
             _lcu.Subscribe("/lol-lobby/v2/lobby", LobbyUpdate);
-            _lcu.Subscribe("/lol-gameflow/v1/session", GameflowUpdate);
+           _lcu.Subscribe("/lol-gameflow/v1/gameflow-phase", GameflowUpdate);
+
+            log("Started LOBBYN");
         }
 
         public void log(string message, bool toFile = true)
@@ -40,6 +56,8 @@ namespace LOBBYN
             Console.WriteLine(message);
 
             if (!File.Exists(_logfilePath)) File.Create(_logfilePath).Close();
+
+            if (!toFile) return;
 
             FileStream fs = File.Open(_logfilePath, FileMode.Append);
             fs.Write(Encoding.UTF8.GetBytes($"{message}\n"));
