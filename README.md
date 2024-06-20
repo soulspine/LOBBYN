@@ -3,7 +3,8 @@
 This app will help League of Legends tournament organizers with managing said tournaments, collecting match data and presenting them. App is still in development.
 
 Things completed:
-- Lobby creation
+- LCU API connection (heavily inspired by [PoniLCU](https://github.com/Ponita0/PoniLCU) but fixes [Stack Overflow on (dis)connection](https://github.com/Ponita0/PoniLCU/issues/19). )
+- Lobby Creation
 - Champ select recording
 - Getting summoner profile info
 
