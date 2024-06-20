@@ -35,6 +35,7 @@ namespace LOBBYN
         // config
         private readonly ConfigParser config = new ConfigParser(File.ReadAllText("config.ini"));
         private string logfilePath;
+        bool logEverything;
 
         // http and websocket
         private HttpClient client = new HttpClient(new HttpClientHandler()
@@ -52,10 +53,12 @@ namespace LOBBYN
         public bool isReady = false;
         public bool isInLobby = false;
         public bool isInChampSelect = false;
+        public Summoner localAccount = null;
 
         public LeagueClient()
         {
             logfilePath = config.GetValue("Logger", "logfile");
+            logEverything = Convert.ToBoolean(config.GetValue("Logger", "logEverything"));
             log("Started LOBBYN.");
 
             handleConnection();
@@ -68,7 +71,7 @@ namespace LOBBYN
                 logError("League of Legends is not running, waiting for it to start...", false);
             }
 
-            RESTART:
+        RESTART:
 
             while (!lcuProcessRunning)
             {
@@ -129,12 +132,13 @@ namespace LOBBYN
 
             foreach (string eventKey in subscriptions.Keys)
             {
-                websocketSubscribe(eventKey, isKey:true);
+                websocketSubscribe(eventKey, isKey: true);
             }
 
             websocketSubscribe("/process-control/v1/process");
+            localAccount = getLocalSummoner();
 
-            log("Connected to the LCU API.", false);
+            log($"Connected to the LCU API. Logged in as {localAccount.gameName}#{localAccount.tagLine}");
         }
 
         private void handleDisconnection(bool byLCUexit = false)
@@ -147,16 +151,20 @@ namespace LOBBYN
 
             isInChampSelect = false;
             isInLobby = false;
+            localAccount = null;
 
             lcuToken = null;
             lcuPort = null;
+
+            log("Disconnected from LCU API");
+
             while (lcuProcessRunning)
             {
                 Thread.Sleep(2000);
                 lcuProcessRunning = isProcessRunning("LeagueClientUx.exe");
             }
             isReady = false;
-            log("League of Legends has been closed... Waiting for it to start again", false);
+            log("League of Legends has been closed... Waiting for it to start again");
             Task.Run(() => handleConnection());
         }
 
@@ -180,7 +188,7 @@ namespace LOBBYN
         private void handleWebsocketMessage(object sender, MessageEventArgs e)
         {
             if (!e.IsText) return;
-            
+
             var arr = JsonConvert.DeserializeObject<JArray>(e.Data);
 
             if (arr.Count != 3) return;
@@ -205,7 +213,7 @@ namespace LOBBYN
                     handleDisconnection(true);
                     return;
                 }
-                
+
             }
 
             if (!subscriptions.ContainsKey(eventKey))
@@ -213,7 +221,7 @@ namespace LOBBYN
                 logError($"Received {eventKey} but there were not methods binded to it.");
                 return;
             }
-            
+
             foreach (Action<OnWebsocketEventArgs> action in subscriptions[eventKey])
             {
                 action(new OnWebsocketEventArgs()
@@ -283,7 +291,7 @@ namespace LOBBYN
             }
             else
             {
-               subscriptions[eventKey].Add(action);
+                subscriptions[eventKey].Add(action);
             }
         }
 
@@ -315,9 +323,6 @@ namespace LOBBYN
                 }
             }
 
-
-
-
             _websocketSubscriptionSend(endpoint, 6);
         }
 
@@ -334,11 +339,10 @@ namespace LOBBYN
 
             if (!File.Exists(logfilePath)) File.Create(logfilePath).Close();
 
-            if (!toFile) return;
-
+            if (!toFile && !logEverything) return;
 
             var sw = new StreamWriter(File.Open(logfilePath, FileMode.Append));
-            sw.Write(Encoding.UTF8.GetBytes($"{message}\n"));
+            sw.Write($"{message}\n");
             sw.Close();
         }
 
@@ -355,7 +359,7 @@ namespace LOBBYN
         private List<(string, string)> getProcessCmdArgs(string processName)
         {
             if (!isProcessRunning(processName)) return new List<(string, string)>();
-            
+
             if (!processName.EndsWith(".exe")) processName += ".exe";
 
             string command = $"wmic process where \"caption='{processName}'\" get CommandLine";
@@ -444,7 +448,7 @@ namespace LOBBYN
             HttpResponseMessage response;
             try
             {
-                response = request(requestMethod.GET, "/lol-gameflow/v1/availability", ignoreReadyCheck:true).Result;
+                response = request(requestMethod.GET, "/lol-gameflow/v1/availability", ignoreReadyCheck: true).Result;
             }
             catch { return null; }
 
@@ -460,5 +464,150 @@ namespace LOBBYN
             }
         }
 
+        internal static class MapType
+        {
+            public const int SUMMONERS_RIFT = 11;
+            public const int HOWLING_ABYSS = 12;
+        }
+
+        internal static class PickType
+        {
+            public const string BLIND = "SimulPickStrategy";
+            public const string DRAFT = "DraftModeSinglePickStrategy";
+            public const string ALL_RANDOM = "AllRandomPickStrategy";
+            public const string TOURNAMENT = "TournamentPickStrategy";
+        }
+
+        internal static class SpectatorPolicy
+        {
+            public const string LOBBY = "LobbyAllowed";
+            public const string FRIENDS = "FriendsAllowed";
+            public const string ALL = "AllAllowed";
+            public const string NONE = "NotAllowed";
+        }
+
+        private List<Summoner> getSummoners(List<Tuple<string, string>> tupList)
+        {
+            List<string> names = new List<string>();
+
+            foreach ((string name, string tagline) in tupList)
+            {
+                names.Add($"{name}#{tagline}");
+            }
+
+            HttpResponseMessage response = request(requestMethod.POST, "/lol-summoner/v2/summoners/names", names).Result;
+
+            if (response == null || response.StatusCode != HttpStatusCode.OK)
+            {
+                string v = "";
+
+                foreach (string n in names) v += $" {n}";
+
+                logError($"Failed to get summoner data for: [{v.Substring(1)}]");
+                return null;
+            }
+            else
+            {
+                return JsonConvert.DeserializeObject<List<Summoner>>(response.Content.ReadAsStringAsync().Result);
+            }
+
+            
+        }
+
+        private Summoner getSummoner(string name, string tagline)
+        {
+            List<Tuple<string, string>> list = new List<Tuple<string, string>> { new Tuple<string, string>(name, tagline) };
+            List<Summoner> outList = getSummoners(list);
+            if (outList == null) return null;
+            else return outList[0];
+        }
+
+        private Summoner getLocalSummoner()
+        {
+            HttpResponseMessage response = request(requestMethod.GET, "/lol-summoner/v1/current-summoner").Result;
+
+            if (response == null || response.StatusCode != HttpStatusCode.OK)
+            {
+                logError("Failed to get local summoner data.");
+                return null;
+            }
+            else
+            {
+                return JsonConvert.DeserializeObject<Summoner>(response.Content.ReadAsStringAsync().Result);
+            }
+        }
+
+        public void CreateLobby(int mapId = MapType.SUMMONERS_RIFT, string lobbyName = "Lobbyn Custom Game", Int16 teamSize = 5, string password = "", string pickType = PickType.TOURNAMENT, string spectatorPolicy = SpectatorPolicy.ALL)
+        {
+            string gamemode;
+            Int16 mutator;
+
+            if (teamSize > 5) teamSize = 5;
+            else if (teamSize < 1) teamSize = 1;
+
+            switch (pickType)
+            {
+                case PickType.BLIND:
+                    mutator = 1;
+                    break;
+                case PickType.DRAFT:
+                    mutator = 2;
+                    break;
+                case PickType.ALL_RANDOM:
+                    mutator = 4;
+                    break;
+                case PickType.TOURNAMENT:
+                    mutator = 6;
+                    break;
+                default:
+                    mutator = 6;
+                    break;
+            }
+
+            switch (mapId)
+            {
+                case MapType.SUMMONERS_RIFT:
+                    gamemode = "CLASSIC";
+                    break;
+                case MapType.HOWLING_ABYSS:
+                    gamemode = "ARAM";
+                    break;
+                default:
+                    gamemode = "CLASSIC";
+                    break;
+            }
+
+            object data = new
+            {
+                customGameLobby = new
+                {
+                    configuration = new
+                    {
+                        gameMode = gamemode,
+                        mapId = mapId,
+                        teamSize = teamSize,
+                        mutators = new
+                        {
+                            id = mutator
+                        },
+                        spectatorPolicy = spectatorPolicy,
+                    },
+                    lobbyName = lobbyName,
+                    lobbyPassword = password,
+                },
+                isCustom = true,
+            };
+
+            HttpResponseMessage response = request(requestMethod.POST, "/lol-lobby/v2/lobby", data).Result;
+
+            if (response == null || response.StatusCode != HttpStatusCode.OK)
+            {
+                logError($"Failed to create lobby \"{lobbyName}\" {gamemode} {pickType} {spectatorPolicy}");
+            }
+            else
+            {
+                log($"Created lobby \"{lobbyName}\" {gamemode} {pickType} {spectatorPolicy}");
+            }
+        }
     }
 }

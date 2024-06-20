@@ -64,7 +64,6 @@
     <None Include="help.json" />
     <None Include="lobbyn.log" />
     <None Include="packages.config" />
-    <None Include="test.json" />
   </ItemGroup>
   <ItemGroup>
     <Content Include=".gitignore" />

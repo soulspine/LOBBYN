@@ -18,7 +18,7 @@ namespace LOBBYN
 
     public class Summoner
     {
-        public long accountId { get; set; }
+        public Int64 accountId { get; set; }
         public string displayName { get; set; }
         public string gameName { get; set; }
         public string internalName { get; set; }
@@ -28,12 +28,12 @@ namespace LOBBYN
         public int profileIconId { get; set; }
         public string puuid { get; set; }
         public RerollPoints rerollPoints { get; set; }
-        public int summonerId { get; set; }
+        public Int64 summonerId { get; set; }
         public int summonerLevel { get; set; }
         public string tagLine { get; set; }
         public bool unnamed { get; set; }
-        public int xpSinceLastLevel { get; set; }
-        public int xpUntilNextLevel { get; set; }
+        public Int64 xpSinceLastLevel { get; set; }
+        public Int64 xpUntilNextLevel { get; set; }
     }
 
 

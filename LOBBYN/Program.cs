@@ -8,7 +8,11 @@ namespace LOBBYN
         {
             LeagueClient lcu = new LeagueClient();
 
-            Console.ReadLine();
+            while (true)
+            {
+                Console.ReadLine();
+                lcu.CreateLobby();
+            }
         }
     }
 }
