@@ -1,4 +1,4 @@
-﻿using PoniLCU;
+﻿/*using PoniLCU;
 using static PoniLCU.LeagueClient;
 
 using Salaros.Configuration;
@@ -16,7 +16,7 @@ namespace LOBBYN
     {
         public bool isReady;
 
-        public LeagueClient _lcu;
+        public LeagueClient? _lcu = null;
         private ConfigParser _config = new ConfigParser(File.ReadAllText("config.ini"));
 
         private bool _inChampSelect = false;
@@ -35,18 +35,33 @@ namespace LOBBYN
             if (!isReady) log("Waiting for League of Legends to be ready...", false);
             while (!isReady)
             {
+                Thread.Sleep(2000);
                 startupChecker = new StartupChecker();
                 isReady = startupChecker.IsLCUReady().Result;
-                Thread.Sleep(2000);
             }
 
             _lcu = new LeagueClient(credentials.cmd);
 
+            _lcu.OnConnected += lcuOnConnected;
+            _lcu.OnDisconnected += lcuOnDisconnected;
+
             _lcu.Subscribe("/lol-champ-select/v1/session", ChampSelectUpdate);
             _lcu.Subscribe("/lol-lobby/v2/lobby", LobbyUpdate);
-           _lcu.Subscribe("/lol-gameflow/v1/gameflow-phase", GameflowUpdate);
+            _lcu.Subscribe("/lol-gameflow/v1/gameflow-phase", GameflowUpdate);
+            _lcu.Subscribe("/process-control/v1/process", ProcessControlUpdate);
+
 
             log("Started LOBBYN");
+        }
+
+        public void lcuOnConnected()
+        {
+            log("Connected to League of Legends client", false);
+        }
+
+        public void lcuOnDisconnected()
+        {
+            log("Disconnected from League of Legends client", false);
         }
 
         public void log(string message, bool toFile = true)
@@ -236,7 +251,22 @@ namespace LOBBYN
 
         private void GameflowUpdate(OnWebsocketEventArgs obj)
         {
+            Console.WriteLine(obj.Data.ToString());
+            if (obj.Data.ToString() == "Lobby")
+            {
+                _lcu.Request(requestMethod.POST, "process-control/v1/process/restart");
+            }
+        }
+
+        private void ProcessControlUpdate(OnWebsocketEventArgs obj)
+        {
             Console.WriteLine(obj.Data);
+            var data = JObject.Parse(obj.Data.ToString());
+            if (data["status"] == "Stopping")
+            {
+                _lcu.ClearAllListeners();
+                _lcu = null;
+            }
         }
 
     }
@@ -262,3 +292,4 @@ namespace LOBBYN
             public const string NONE = "NotAllowed";
         }
     }
+*/
