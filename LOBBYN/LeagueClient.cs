@@ -1,8 +1,6 @@
-﻿using Salaros.Configuration;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using System.Net;
@@ -15,14 +13,14 @@ using System.IO;
 using System.Threading;
 using System.Collections.Concurrent;
 
-namespace LOBBYN
+namespace soulspine
 {
     // THIS CLASS WAS CREATED TO PROPERLY HANDLE CONNECTIONS AND DISCONNECTIONS TO THE LEAGUE CLIENT
     // INSPIRED BY https://github.com/Ponita0/PoniLCU AND MODIFIED TO FIT THE PROJECT
     // PREVIOUS COMMITS USED PoniLCU BUT IT WAS CAUSING STACK OVERFLOWS
     // THIS ISSUE WAS REPORTED AND THERE IS NO INTENT OF FIXING IT
     // https://github.com/Ponita0/PoniLCU/issues/19
-    internal class LeagueClient
+    public class LeagueClient
     {
         private bool firstConnection = true;
 
@@ -33,9 +31,7 @@ namespace LOBBYN
         private bool lcuProcessRunning;
 
         // config
-        private readonly ConfigParser config = new ConfigParser(File.ReadAllText("config.ini"));
-        private string logfilePath;
-        bool logEverything;
+        public LeagueClientConfig config { get; private set; }
 
         // http and websocket
         private HttpClient client = new HttpClient(new HttpClientHandler()
@@ -49,20 +45,39 @@ namespace LOBBYN
         private WebSocket socketConnection = null;
         ConcurrentDictionary<string, List<Action<OnWebsocketEventArgs>>> subscriptions = new ConcurrentDictionary<string, List<Action<OnWebsocketEventArgs>>>();
 
-        // status
-        public bool isReady = false;
-        public bool isInLobby = false;
-        public bool isInChampSelect = false;
-        public Summoner localAccount = null;
+        //events
+        public EventHandler<EventArgs> OnLobbyEnter = null;
+        public EventHandler<EventArgs> OnLobbyLeave = null;
+        public EventHandler<EventArgs> OnChampSelectEnter = null;
+        public EventHandler<EventArgs> OnChampSelectLeave = null;
+        public EventHandler<EventArgs> OnGameEnter = null;
+        public EventHandler<EventArgs> OnGameLeave = null;
 
-        public LeagueClient()
+        // status
+        public bool isConnected { get; private set; }
+        public bool isInLobby { get; private set; }
+        public bool isInChampSelect { get; private set; }
+        public bool isInGame { get; private set; }
+
+        public Summoner localSummoner { get; private set; }
+        public string localSummonerRegion { get; private set; }
+
+        public LeagueClient(LeagueClientConfig config = null)
         {
-            logfilePath = config.GetValue("Logger", "logfile");
-            logEverything = Convert.ToBoolean(config.GetValue("Logger", "logEverything"));
+            if (config == null)
+            {
+                config = new LeagueClientConfig();
+            }
+
+            this.config = config;
+            
             log("Started LOBBYN.");
 
             handleConnection();
         }
+
+        //handles are the only things allowed to use .Result instead of await
+        //just because I SAID SO
 
         private void handleConnection()
         {
@@ -106,7 +121,7 @@ namespace LOBBYN
                 goto RESTART;
             }
 
-            bool? apiConnected = lcuApiReadyCheck();
+            bool? apiConnected = lcuApiReadyCheck().Result;
 
             while (true)
             {
@@ -114,7 +129,7 @@ namespace LOBBYN
                 else if (apiConnected == false)
                 {
                     Thread.Sleep(2000);
-                    apiConnected = lcuApiReadyCheck();
+                    apiConnected = lcuApiReadyCheck().Result;
                 }
                 else break; //ready
             }
@@ -127,18 +142,32 @@ namespace LOBBYN
             socketConnection.OnClose += handleWebsocketDisconnection;
             socketConnection.Connect();
 
-            isReady = true;
+            isConnected = true;
             if (firstConnection) firstConnection = false;
 
-            foreach (string eventKey in subscriptions.Keys)
+            _websocketSubscriptionSend("OnJsonApiEvent", 5, isKey:true); //subscribing to all events because then you can assign methods to endpoint and not event - tldr its simpler and safer
+
+            isInLobby = false;
+            isInChampSelect = false;
+            isInGame = false;
+
+            HttpResponseMessage gameflowResponse = request(requestMethod.GET, "/lol-gameflow/v1/gameflow-phase").Result;
+
+            if (gameflowResponse == null || gameflowResponse.StatusCode != HttpStatusCode.OK)
             {
-                websocketSubscribe(eventKey, isKey: true);
+                logError("Failed to get gameflow phase at startup.");
+                gameflowEventProc("None");
+            }
+            else
+            {
+                gameflowEventProc(gameflowResponse.Content.ReadAsStringAsync().Result.Replace("\"", ""));
             }
 
-            websocketSubscribe("/process-control/v1/process");
-            localAccount = getLocalSummoner();
 
-            log($"Connected to the LCU API. Logged in as {localAccount.gameName}#{localAccount.tagLine}");
+            localSummoner = getLocalSummonerFromLCU().Result;
+            localSummonerRegion = getSummonerRegionFromLCU(localSummoner).Result;
+
+            log($"Connected to the LCU API. Logged in as {localSummoner.gameName}#{localSummoner.tagLine} - {localSummonerRegion}");
         }
 
         private void handleDisconnection(bool byLCUexit = false)
@@ -147,11 +176,16 @@ namespace LOBBYN
 
             if (byLCUexit) return;
 
+            isConnected = false;
+
             socketConnection = null;
 
             isInChampSelect = false;
             isInLobby = false;
-            localAccount = null;
+            isInLobby = false;
+
+            localSummoner = null;
+            localSummonerRegion = null;
 
             lcuToken = null;
             lcuPort = null;
@@ -163,31 +197,20 @@ namespace LOBBYN
                 Thread.Sleep(2000);
                 lcuProcessRunning = isProcessRunning("LeagueClientUx.exe");
             }
-            isReady = false;
+
             log("League of Legends has been closed... Waiting for it to start again");
             Task.Run(() => handleConnection());
         }
 
-        public class OnWebsocketEventArgs : EventArgs
-        {   // URI    
-            public string Endpoint { get; set; }
-
-            // Update create delete
-            public string Type { get; set; }
-
-            // data :D
-            public dynamic Data { get; set; }
-        }
-
         private string _websocketEventFromEndpoint(string endpoint)
         {
-            if (endpoint.StartsWith("/")) endpoint = endpoint.Substring(1);
-            return "OnJsonApiEvent_" + endpoint.Replace("/", "_");
+            if (!endpoint.StartsWith("/")) endpoint = "/" + endpoint;
+            return "OnJsonApiEvent" + endpoint.Replace("/", "_");
         }
 
         private void handleWebsocketMessage(object sender, MessageEventArgs e)
         {
-            if (!e.IsText) return;
+            //Console.WriteLine(e.Data);
 
             var arr = JsonConvert.DeserializeObject<JArray>(e.Data);
 
@@ -198,44 +221,93 @@ namespace LOBBYN
             string eventKey = arr[1].ToString();
             dynamic data = arr[2];
 
-            if (eventKey == "OnJsonApiEvent_process-control_v1_process")
+            if (eventKey != "OnJsonApiEvent")
             {
-                OnWebsocketEventArgs args = new OnWebsocketEventArgs()
-                {
-                    Endpoint = data["uri"].ToString(),
-                    Type = data["eventType"].ToString(),
-                    Data = data["data"]
-                };
+                logError($"Received unknown event key: {eventKey}");
+                return;
+            }
 
+            OnWebsocketEventArgs args = new OnWebsocketEventArgs()
+            {
+                Endpoint = data["uri"].ToString(),
+                Type = data["eventType"].ToString(),
+                Data = data["data"]
+            };
+
+            // special case for exiting the client
+            if (args.Endpoint == "/process-control/v1/process")
+            {
                 string status = args.Data["status"].ToString();
                 if (status == "Stopping")
                 {
                     handleDisconnection(true);
                     return;
                 }
-
             }
-
-            if (!subscriptions.ContainsKey(eventKey))
+            // gameflow updates
+            else if (args.Endpoint == "/lol-gameflow/v1/gameflow-phase")
             {
-                logError($"Received {eventKey} but there were not methods binded to it.");
-                return;
+                gameflowEventProc(args.Data.ToString());
             }
 
-            foreach (Action<OnWebsocketEventArgs> action in subscriptions[eventKey])
-            {
-                action(new OnWebsocketEventArgs()
-                {
-                    Endpoint = data["uri"].ToString(),
-                    Type = data["eventType"].ToString(),
-                    Data = data["data"]
-                });
-            }
+            if (!subscriptions.ContainsKey(args.Endpoint)) return;
+
+            foreach (Action<OnWebsocketEventArgs> action in subscriptions[args.Endpoint]) action(args);
         }
 
         private void mock(OnWebsocketEventArgs e)
         {
             Console.WriteLine(e.Data);
+        }
+
+        private void gameflowEventProc(string phase)
+        {
+            switch (phase)
+            {
+                case "None":
+                    if (isInLobby) OnLobbyLeave?.Invoke(this, EventArgs.Empty);
+                    else if (isInChampSelect) OnChampSelectLeave?.Invoke(this, EventArgs.Empty);
+                    else if (isInGame) OnGameLeave?.Invoke(this, EventArgs.Empty);
+
+                    isInLobby = false;
+                    isInChampSelect = false;
+                    isInGame = false;
+
+                    break;
+
+                case "Lobby":
+                    if (isInChampSelect) OnChampSelectLeave?.Invoke(this, EventArgs.Empty);
+                    else if (isInGame) OnGameLeave?.Invoke(this, EventArgs.Empty);
+
+                    OnLobbyEnter?.Invoke(this, EventArgs.Empty);
+
+                    isInLobby = true;
+                    isInChampSelect = false;
+                    isInGame = false;
+                    break;
+
+                case "ChampSelect":
+                    if (isInLobby) OnLobbyLeave?.Invoke(this, EventArgs.Empty);
+                    else if (isInGame) OnGameLeave?.Invoke(this, EventArgs.Empty);
+
+                    OnChampSelectEnter?.Invoke(this, EventArgs.Empty);
+
+                    isInLobby = false;
+                    isInChampSelect = true;
+                    isInGame = false;
+                    break;
+
+                case "InProgress":
+                    if (isInLobby) OnLobbyLeave?.Invoke(this, EventArgs.Empty);
+                    else if (isInChampSelect) OnChampSelectLeave?.Invoke(this, EventArgs.Empty);
+
+                    OnGameEnter?.Invoke(this, EventArgs.Empty);
+
+                    isInLobby = false;
+                    isInChampSelect = false;
+                    isInGame = true;
+                    break;
+            }
         }
 
         private void handleWebsocketDisconnection(object sender, CloseEventArgs e)
@@ -244,9 +316,9 @@ namespace LOBBYN
             handleDisconnection();
         }
 
-        private bool _websocketSubscriptionSend(string endpoint, int opcode)
+        private bool _websocketSubscriptionSend(string endpoint, int opcode, bool isKey = false)
         {
-            if (!isReady || socketConnection == null)
+            if (!isConnected || socketConnection == null)
             {
                 switch (opcode)
                 {
@@ -266,40 +338,42 @@ namespace LOBBYN
                 return false;
             }
 
-            socketConnection.Send($"[{opcode}, \"{_websocketEventFromEndpoint(endpoint)}\"]");
+            if (!isKey) socketConnection.Send($"[{opcode}, \"{_websocketEventFromEndpoint(endpoint)}\"]");
+            else socketConnection.Send($"[{opcode}, \"{endpoint}\"]");
             return true;
         }
 
-        private void websocketSubscribe(string endpoint, Action<OnWebsocketEventArgs> action = null, bool isKey = false)
+        public void Subscribe(string endpoint, Action<OnWebsocketEventArgs> action)
         {
+            websocketSubscribe(endpoint, action);
+        }
 
-            if (isKey) endpoint = endpoint.Replace("OnJsonApiEvent_", "").Replace("_", "/");
+        public void Unsubscribe(string endpoint, Action<OnWebsocketEventArgs> action)
+        {
+            websocketUnsubscribe(endpoint, action);
+        }
 
-            if (!_websocketSubscriptionSend(endpoint, 5))
-            {
-                logError($"Failed to subscribe to {endpoint}.");
-                return;
-            }
-
+        private void websocketSubscribe(string endpoint, Action<OnWebsocketEventArgs> action = null)
+        {
             if (action == null) return;
 
-            string eventKey = _websocketEventFromEndpoint(endpoint);
+            if (!endpoint.StartsWith("/")) endpoint = "/" + endpoint;
 
-            if (!subscriptions.ContainsKey(eventKey))
+            if (!subscriptions.ContainsKey(endpoint))
             {
-                subscriptions.TryAdd(eventKey, new List<Action<OnWebsocketEventArgs>>() { action });
+                subscriptions.TryAdd(endpoint, new List<Action<OnWebsocketEventArgs>>() { action });
             }
             else
             {
-                subscriptions[eventKey].Add(action);
+                subscriptions[endpoint].Add(action);
             }
         }
 
         private void websocketUnsubscribe(string endpoint, Action<OnWebsocketEventArgs> action = null)
         {
-            string eventKey = _websocketEventFromEndpoint(endpoint);
+            if (!endpoint.StartsWith("/")) endpoint = "/" + endpoint;
 
-            if (!subscriptions.ContainsKey(eventKey))
+            if (!subscriptions.ContainsKey(endpoint))
             {
                 logError($"Tried to unsubscribe from {endpoint}, but there are no actions binded to it.");
                 return;
@@ -307,23 +381,19 @@ namespace LOBBYN
 
             if (action == null)
             {
-                subscriptions.TryRemove(eventKey, out _);
-                _websocketSubscriptionSend(endpoint, 6);
+                subscriptions.TryRemove(endpoint, out _);
             }
             else
             {
-                if (!subscriptions[eventKey].Remove(action))
+                if (!subscriptions[endpoint].Remove(action))
                 {
                     logError($"Tried to unsubscribe {action.ToString()} from {endpoint}, but this action was not bound.");
                 }
-                else if (subscriptions[eventKey].Count == 0)
+                else if (subscriptions[endpoint].Count == 0)
                 {
-                    subscriptions.TryRemove(eventKey, out _);
-                    _websocketSubscriptionSend(endpoint, 6);
+                    subscriptions.TryRemove(endpoint, out _);
                 }
             }
-
-            _websocketSubscriptionSend(endpoint, 6);
         }
 
         private void websocketClearSubscriptions()
@@ -337,16 +407,16 @@ namespace LOBBYN
             message = $"{dateSig} {message}";
             Console.WriteLine(message);
 
-            if (!File.Exists(logfilePath)) File.Create(logfilePath).Close();
+            if (!File.Exists(config.logfilePath)) File.Create(config.logfilePath).Close();
 
-            if (!toFile && !logEverything) return;
+            if (!toFile && !config.logEverything) return;
 
-            var sw = new StreamWriter(File.Open(logfilePath, FileMode.Append));
+            var sw = new StreamWriter(File.Open(config.logfilePath, FileMode.Append));
             sw.Write($"{message}\n");
             sw.Close();
         }
 
-        private void logError(string message, bool toFile = true)
+        public void logError(string message, bool toFile = true)
         {
             log($"[ERROR] {message}", toFile);
         }
@@ -401,14 +471,9 @@ namespace LOBBYN
             return System.Convert.ToBase64String(plainTextBytes);
         }
 
-        public enum requestMethod
+        public async Task<HttpResponseMessage> request(requestMethod method, string endpoint, dynamic data = null, bool ignoreReadyCheck = false)
         {
-            GET, POST, PATCH, DELETE, PUT
-        }
-
-        private async Task<HttpResponseMessage> request(requestMethod method, string endpoint, dynamic data = null, bool ignoreReadyCheck = false)
-        {
-            if (!ignoreReadyCheck && !isReady)
+            if (!ignoreReadyCheck && !isConnected)
             {
                 logError($"Tried to request {endpoint}, but LCU is not connected yet.");
                 return null;
@@ -443,12 +508,12 @@ namespace LOBBYN
             }
         }
 
-        private bool? lcuApiReadyCheck()
+        private async Task<bool?> lcuApiReadyCheck()
         {
             HttpResponseMessage response;
             try
             {
-                response = request(requestMethod.GET, "/lol-gameflow/v1/availability", ignoreReadyCheck: true).Result;
+                response = await request(requestMethod.GET, "/lol-gameflow/v1/availability", ignoreReadyCheck: true);
             }
             catch { return null; }
 
@@ -458,35 +523,13 @@ namespace LOBBYN
             }
             else
             {
-                JObject json = JObject.Parse(response.Content.ReadAsStringAsync().Result);
+                JObject json = JObject.Parse(await response.Content.ReadAsStringAsync());
                 if (json == null) return null;
                 else return json["isAvailable"].ToObject<bool>();
             }
         }
 
-        internal static class MapType
-        {
-            public const int SUMMONERS_RIFT = 11;
-            public const int HOWLING_ABYSS = 12;
-        }
-
-        internal static class PickType
-        {
-            public const string BLIND = "SimulPickStrategy";
-            public const string DRAFT = "DraftModeSinglePickStrategy";
-            public const string ALL_RANDOM = "AllRandomPickStrategy";
-            public const string TOURNAMENT = "TournamentPickStrategy";
-        }
-
-        internal static class SpectatorPolicy
-        {
-            public const string LOBBY = "LobbyAllowed";
-            public const string FRIENDS = "FriendsAllowed";
-            public const string ALL = "AllAllowed";
-            public const string NONE = "NotAllowed";
-        }
-
-        private List<Summoner> getSummoners(List<Tuple<string, string>> tupList)
+        public async Task<List<Summoner>> GetSummoners(List<Tuple<string, string>> tupList)
         {
             List<string> names = new List<string>();
 
@@ -495,7 +538,7 @@ namespace LOBBYN
                 names.Add($"{name}#{tagline}");
             }
 
-            HttpResponseMessage response = request(requestMethod.POST, "/lol-summoner/v2/summoners/names", names).Result;
+            HttpResponseMessage response = await request(requestMethod.POST, "/lol-summoner/v2/summoners/names", names);
 
             if (response == null || response.StatusCode != HttpStatusCode.OK)
             {
@@ -508,23 +551,23 @@ namespace LOBBYN
             }
             else
             {
-                return JsonConvert.DeserializeObject<List<Summoner>>(response.Content.ReadAsStringAsync().Result);
+                return JsonConvert.DeserializeObject<List<Summoner>>(await response.Content.ReadAsStringAsync());
             }
 
             
         }
 
-        private Summoner getSummoner(string name, string tagline)
+        public async Task<Summoner> GetSummoner(string name, string tagline)
         {
             List<Tuple<string, string>> list = new List<Tuple<string, string>> { new Tuple<string, string>(name, tagline) };
-            List<Summoner> outList = getSummoners(list);
-            if (outList == null) return null;
+            List<Summoner> outList = await GetSummoners(list);
+            if (outList == null || outList.Count == 0) return null;
             else return outList[0];
         }
 
-        private Summoner getLocalSummoner()
+        private async Task<Summoner> getLocalSummonerFromLCU()
         {
-            HttpResponseMessage response = request(requestMethod.GET, "/lol-summoner/v1/current-summoner").Result;
+            HttpResponseMessage response = await request(requestMethod.GET, "/lol-summoner/v1/current-summoner");
 
             if (response == null || response.StatusCode != HttpStatusCode.OK)
             {
@@ -533,81 +576,85 @@ namespace LOBBYN
             }
             else
             {
-                return JsonConvert.DeserializeObject<Summoner>(response.Content.ReadAsStringAsync().Result);
+                return JsonConvert.DeserializeObject<Summoner>(await response.Content.ReadAsStringAsync());
             }
         }
 
-        public void CreateLobby(int mapId = MapType.SUMMONERS_RIFT, string lobbyName = "Lobbyn Custom Game", Int16 teamSize = 5, string password = "", string pickType = PickType.TOURNAMENT, string spectatorPolicy = SpectatorPolicy.ALL)
+        private async Task<string> getSummonerRegionFromLCU(Summoner summoner)
         {
-            string gamemode;
-            Int16 mutator;
-
-            if (teamSize > 5) teamSize = 5;
-            else if (teamSize < 1) teamSize = 1;
-
-            switch (pickType)
-            {
-                case PickType.BLIND:
-                    mutator = 1;
-                    break;
-                case PickType.DRAFT:
-                    mutator = 2;
-                    break;
-                case PickType.ALL_RANDOM:
-                    mutator = 4;
-                    break;
-                case PickType.TOURNAMENT:
-                    mutator = 6;
-                    break;
-                default:
-                    mutator = 6;
-                    break;
-            }
-
-            switch (mapId)
-            {
-                case MapType.SUMMONERS_RIFT:
-                    gamemode = "CLASSIC";
-                    break;
-                case MapType.HOWLING_ABYSS:
-                    gamemode = "ARAM";
-                    break;
-                default:
-                    gamemode = "CLASSIC";
-                    break;
-            }
-
-            object data = new
-            {
-                customGameLobby = new
-                {
-                    configuration = new
-                    {
-                        gameMode = gamemode,
-                        mapId = mapId,
-                        teamSize = teamSize,
-                        mutators = new
-                        {
-                            id = mutator
-                        },
-                        spectatorPolicy = spectatorPolicy,
-                    },
-                    lobbyName = lobbyName,
-                    lobbyPassword = password,
-                },
-                isCustom = true,
-            };
-
-            HttpResponseMessage response = request(requestMethod.POST, "/lol-lobby/v2/lobby", data).Result;
+            HttpResponseMessage response = await request(requestMethod.GET, $"/riotclient/region-locale");
 
             if (response == null || response.StatusCode != HttpStatusCode.OK)
             {
-                logError($"Failed to create lobby \"{lobbyName}\" {gamemode} {pickType} {spectatorPolicy}");
+                logError("Failed to get region locale.");
+                return null;
             }
             else
             {
-                log($"Created lobby \"{lobbyName}\" {gamemode} {pickType} {spectatorPolicy}");
+                string region = JObject.Parse(await response.Content.ReadAsStringAsync())["region"].ToString();
+
+                return region;
             }
         }
+    }
+
+    public enum requestMethod
+    {
+        GET, POST, PATCH, DELETE, PUT
+    }
+
+    public class LeagueClientConfig
+    {
+        public bool logToFile { get; set; }
+        public bool logEverything { get; set; }
+        public string logfilePath { get; set;}
+
+        public LeagueClientConfig()
+        {
+            logToFile = true;
+            logEverything = true;
+            logfilePath = "soulspineLCU.log";
+        }
+
+    }
+
+    public class OnWebsocketEventArgs : EventArgs
+    {   // URI    
+        public string Endpoint { get; set; }
+
+        // Update create delete
+        public string Type { get; set; }
+
+        // data :D
+        public dynamic Data { get; set; }
+    }
+
+    public class RerollPoints
+    {
+        public int currentPoints { get; set; }
+        public int maxRolls { get; set; }
+        public int numberOfRolls { get; set; }
+        public int pointsCostToRoll { get; set; }
+        public int pointsToReroll { get; set; }
+    }
+
+    public class Summoner
+    {
+        public Int64 accountId { get; set; }
+        public string displayName { get; set; }
+        public string gameName { get; set; }
+        public string internalName { get; set; }
+        public bool nameChangeFlag { get; set; }
+        public int percentCompleteForNextLevel { get; set; }
+        public string privacy { get; set; }
+        public int profileIconId { get; set; }
+        public string puuid { get; set; }
+        public RerollPoints rerollPoints { get; set; }
+        public Int64 summonerId { get; set; }
+        public int summonerLevel { get; set; }
+        public string tagLine { get; set; }
+        public bool unnamed { get; set; }
+        public Int64 xpSinceLastLevel { get; set; }
+        public Int64 xpUntilNextLevel { get; set; }
     }
 }
