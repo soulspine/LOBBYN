@@ -1,4 +1,5 @@
 ﻿using System.Collections.Generic;
+using System;
 
 namespace LOBBYN
 {
@@ -98,7 +99,7 @@ namespace LOBBYN
         public object strawberryMapId { get; set; }
         public object subteamIndex { get; set; }
         public int summonerIconId { get; set; }
-        public int summonerId { get; set; }
+        public Int64 summonerId { get; set; }
         public string summonerInternalName { get; set; }
         public int summonerLevel { get; set; }
         public string summonerName { get; set; }

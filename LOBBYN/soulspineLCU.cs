@@ -13,17 +13,13 @@ using System.IO;
 using System.Threading;
 using System.Collections.Concurrent;
 
-namespace soulspine
+namespace soulspineLCU
 {
     // THIS CLASS WAS CREATED TO PROPERLY HANDLE CONNECTIONS AND DISCONNECTIONS TO THE LEAGUE CLIENT
-    // INSPIRED BY https://github.com/Ponita0/PoniLCU AND MODIFIED TO FIT THE PROJECT
-    // PREVIOUS COMMITS USED PoniLCU BUT IT WAS CAUSING STACK OVERFLOWS
-    // THIS ISSUE WAS REPORTED AND THERE IS NO INTENT OF FIXING IT
+    // HEAVILY INSPIRED BY https://github.com/Ponita0/PoniLCU BUT FUNDAMENTALLY MODIFIED
     // https://github.com/Ponita0/PoniLCU/issues/19
     public class LeagueClient
     {
-        private bool firstConnection = true;
-
         // process 
         private int? lcuPort = null;
         private string lcuToken = null;
@@ -46,12 +42,15 @@ namespace soulspine
         ConcurrentDictionary<string, List<Action<OnWebsocketEventArgs>>> subscriptions = new ConcurrentDictionary<string, List<Action<OnWebsocketEventArgs>>>();
 
         //events
-        public EventHandler<EventArgs> OnLobbyEnter = null;
-        public EventHandler<EventArgs> OnLobbyLeave = null;
-        public EventHandler<EventArgs> OnChampSelectEnter = null;
-        public EventHandler<EventArgs> OnChampSelectLeave = null;
-        public EventHandler<EventArgs> OnGameEnter = null;
-        public EventHandler<EventArgs> OnGameLeave = null;
+        public event Action OnConnected = null;
+        public event Action OnDisconnected = null;
+
+        public event Action OnLobbyEnter = null;
+        public event Action OnLobbyLeave = null;
+        public event Action OnChampSelectEnter = null;
+        public event Action OnChampSelectLeave = null;
+        public event Action OnGameEnter = null;
+        public event Action OnGameLeave = null;
 
         // status
         public bool isConnected { get; private set; }
@@ -70,18 +69,34 @@ namespace soulspine
             }
 
             this.config = config;
-            
-            log("Started LOBBYN.");
-
-            handleConnection();
         }
 
         //handles are the only things allowed to use .Result instead of await
         //just because I SAID SO
 
+        public void Connect()
+        {
+            if (isConnected)
+            {
+                logError("Tried to connect to LCU, but it is already connected.");
+                return;
+            }
+            handleConnection();
+        }
+
+        public void Disconnect()
+        {
+            if (!isConnected)
+            {
+                logError("Tried to disconnect from LCU, but it is not connected.");
+                return;
+            }
+            handleDisconnection(true);
+        }
+
         private void handleConnection()
         {
-            if (!(lcuProcessRunning = isProcessRunning("LeagueClientUx")) && firstConnection)
+            if (!(lcuProcessRunning = isProcessRunning("LeagueClientUx")))
             {
                 logError("League of Legends is not running, waiting for it to start...", false);
             }
@@ -143,9 +158,8 @@ namespace soulspine
             socketConnection.Connect();
 
             isConnected = true;
-            if (firstConnection) firstConnection = false;
 
-            _websocketSubscriptionSend("OnJsonApiEvent", 5, isKey:true); //subscribing to all events because then you can assign methods to endpoint and not event - tldr its simpler and safer
+            _websocketSubscriptionSend("OnJsonApiEvent", 5, isKey: true); //subscribing to all events because then you can assign methods to endpoint and not event - tldr its simpler and safer
 
             isInLobby = false;
             isInChampSelect = false;
@@ -168,21 +182,23 @@ namespace soulspine
             localSummonerRegion = getSummonerRegionFromLCU(localSummoner).Result;
 
             log($"Connected to the LCU API. Logged in as {localSummoner.gameName}#{localSummoner.tagLine} - {localSummonerRegion}");
+            OnConnected?.Invoke();
         }
 
-        private void handleDisconnection(bool byLCUexit = false)
+        private void handleDisconnection(bool byExit = false)
         {
             if (socketConnection.IsAlive) socketConnection.Close();
 
-            if (byLCUexit) return;
+            if (byExit) return;
+            else
 
-            isConnected = false;
+                isConnected = false;
 
             socketConnection = null;
 
             isInChampSelect = false;
             isInLobby = false;
-            isInLobby = false;
+            isInGame = false;
 
             localSummoner = null;
             localSummonerRegion = null;
@@ -190,16 +206,11 @@ namespace soulspine
             lcuToken = null;
             lcuPort = null;
 
+            OnDisconnected?.Invoke();
+
             log("Disconnected from LCU API");
 
-            while (lcuProcessRunning)
-            {
-                Thread.Sleep(2000);
-                lcuProcessRunning = isProcessRunning("LeagueClientUx.exe");
-            }
-
-            log("League of Legends has been closed... Waiting for it to start again");
-            Task.Run(() => handleConnection());
+            if (config.autoReconnect) handleConnection();
         }
 
         private string _websocketEventFromEndpoint(string endpoint)
@@ -215,8 +226,7 @@ namespace soulspine
             var arr = JsonConvert.DeserializeObject<JArray>(e.Data);
 
             if (arr.Count != 3) return;
-            else if (Convert.ToInt32(arr[0]) != 8) return;
-            else if (!arr[1].ToString().StartsWith("OnJsonApiEvent")) return;
+            else if (Convert.ToInt16(arr[0]) != 8) return;
 
             string eventKey = arr[1].ToString();
             dynamic data = arr[2];
@@ -265,9 +275,9 @@ namespace soulspine
             switch (phase)
             {
                 case "None":
-                    if (isInLobby) OnLobbyLeave?.Invoke(this, EventArgs.Empty);
-                    else if (isInChampSelect) OnChampSelectLeave?.Invoke(this, EventArgs.Empty);
-                    else if (isInGame) OnGameLeave?.Invoke(this, EventArgs.Empty);
+                    if (isInChampSelect) OnChampSelectLeave?.Invoke();
+                    if (isInLobby) OnLobbyLeave?.Invoke();
+                    if (isInGame) OnGameLeave?.Invoke();
 
                     isInLobby = false;
                     isInChampSelect = false;
@@ -276,10 +286,10 @@ namespace soulspine
                     break;
 
                 case "Lobby":
-                    if (isInChampSelect) OnChampSelectLeave?.Invoke(this, EventArgs.Empty);
-                    else if (isInGame) OnGameLeave?.Invoke(this, EventArgs.Empty);
+                    if (isInChampSelect) OnChampSelectLeave?.Invoke();
+                    if (isInGame) OnGameLeave?.Invoke();
 
-                    OnLobbyEnter?.Invoke(this, EventArgs.Empty);
+                    OnLobbyEnter?.Invoke();
 
                     isInLobby = true;
                     isInChampSelect = false;
@@ -287,10 +297,10 @@ namespace soulspine
                     break;
 
                 case "ChampSelect":
-                    if (isInLobby) OnLobbyLeave?.Invoke(this, EventArgs.Empty);
-                    else if (isInGame) OnGameLeave?.Invoke(this, EventArgs.Empty);
+                    if (isInLobby) OnLobbyLeave?.Invoke();
+                    if (isInGame) OnGameLeave?.Invoke();
 
-                    OnChampSelectEnter?.Invoke(this, EventArgs.Empty);
+                    OnChampSelectEnter?.Invoke();
 
                     isInLobby = false;
                     isInChampSelect = true;
@@ -298,10 +308,10 @@ namespace soulspine
                     break;
 
                 case "InProgress":
-                    if (isInLobby) OnLobbyLeave?.Invoke(this, EventArgs.Empty);
-                    else if (isInChampSelect) OnChampSelectLeave?.Invoke(this, EventArgs.Empty);
+                    if (isInLobby) OnLobbyLeave?.Invoke();
+                    if (isInChampSelect) OnChampSelectLeave?.Invoke();
 
-                    OnGameEnter?.Invoke(this, EventArgs.Empty);
+                    OnGameEnter?.Invoke();
 
                     isInLobby = false;
                     isInChampSelect = false;
@@ -348,7 +358,7 @@ namespace soulspine
             websocketSubscribe(endpoint, action);
         }
 
-        public void Unsubscribe(string endpoint, Action<OnWebsocketEventArgs> action)
+        public void Unsubscribe(string endpoint, Action<OnWebsocketEventArgs> action = null)
         {
             websocketUnsubscribe(endpoint, action);
         }
@@ -554,7 +564,7 @@ namespace soulspine
                 return JsonConvert.DeserializeObject<List<Summoner>>(await response.Content.ReadAsStringAsync());
             }
 
-            
+
         }
 
         public async Task<Summoner> GetSummoner(string name, string tagline)
@@ -603,19 +613,23 @@ namespace soulspine
         GET, POST, PATCH, DELETE, PUT
     }
 
+    public enum QueueID
+    {
+        CUSTOM = -1,
+        QUICKPLAY = 490,
+        NORMAL_DRAFT = 400,
+        RANKED_SOLO = 420,
+        RANKED_FLEX = 440,
+        ARAM = 450,
+        ARENA = 1700,
+    }
+
     public class LeagueClientConfig
     {
-        public bool logToFile { get; set; }
-        public bool logEverything { get; set; }
-        public string logfilePath { get; set;}
-
-        public LeagueClientConfig()
-        {
-            logToFile = true;
-            logEverything = true;
-            logfilePath = "soulspineLCU.log";
-        }
-
+        public bool autoReconnect = false;
+        public bool logToFile = true;
+        public bool logEverything = false; 
+        public string logfilePath = "soulspineLCU.log";
     }
 
     public class OnWebsocketEventArgs : EventArgs
