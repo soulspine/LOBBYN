@@ -6,24 +6,33 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Tasks;
 using System.Net;
-using soulspineLCU;
+using soulspine.LCU;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json;
 using System.IO;
+using OBSWebsocketDotNet;
+using soulspine.LOBBYN;
 
 namespace LOBBYN
 {
-    internal class LOBBYN : LeagueClient
+    internal class LOBBYN
     {
         private List<JObject> champSelectEventHistory;
+        private JObject lastChampSelectEventRaw; //needed to compare changes, otherwise its a bit of a mess
+
         private Lobby lastLobbyDetails = null;
         private DateTime? lastLobbyEnterTimestamp = null;
-
+        private string lastSavedChampSelectFilepath = null;
         private DateTime? lastChampSelectEnterTimestamp = null;
 
         private LOBBYNconfig lobbynConfig;
 
-        public LOBBYN(LOBBYNconfig config = null) : base(config.lcuConfig)
+        public LeagueClient lcu { get; private set; } = new LeagueClient();
+        public OBSWebsocket obs { get; private set; } = new OBSWebsocket();
+
+        private Logger logger = new Logger("soulspineLCU.log");
+
+        public LOBBYN(LOBBYNconfig config = null)
         {
             if (config != null)
             {
@@ -32,34 +41,42 @@ namespace LOBBYN
 
             lobbynConfig = config;
 
-            OnChampSelectEnter += ChampSelectRecordingEnable;
-            OnChampSelectLeave += ChampSelectRecordingDisable;
+            lcu.OnChampSelectEnter += ChampSelectRecordingEnable;
+            lcu.OnChampSelectLeave += ChampSelectRecordingDisable;
 
-            OnLobbyEnter += CaptureCurrentLobby;
+            lcu.OnLobbyEnter += CaptureCurrentLobby;
 
-            Subscribe("/lol-gameflow/v1/gameflow-phase", gameflowUpdate);
+            lcu.Subscribe("/lol-gameflow/v1/gameflow-phase", gameflowUpdate);
+
+            if (lcu.isInChampSelect) ChampSelectRecordingEnable();
         }
 
         private void gameflowUpdate(OnWebsocketEventArgs e)
         {
-            log(e.Data.ToString(), false);
+            logger.log(e.Data.ToString(), false);
         }
 
         private void _champSelectRecordingOnUpdate(OnWebsocketEventArgs e)
         {
-            champSelectEventHistory.Add(JObject.Parse(e.Data.ToString()));
+            champSelectEventHistory.Add(onlyChangedKeys(JObject.Parse(e.Data.ToString()), lastChampSelectEventRaw));
+        }
+
+        public void ChampSelectProjection(string filename) //TODO - CHAMP SELECT RENDER IN OBS
+        {
+            JArray champSelectEvents = JArray.Parse(File.ReadAllText(filename));
         }
 
         public void ChampSelectRecordingEnable()
         {
             champSelectEventHistory = new List<JObject>();
-            Subscribe("/lol-champ-select/v1/session", _champSelectRecordingOnUpdate);
+            lastChampSelectEventRaw = null;
+            lcu.Subscribe("/lol-champ-select/v1/session", _champSelectRecordingOnUpdate);
             lastChampSelectEnterTimestamp = DateTime.Now;
         }
 
         public void ChampSelectRecordingDisable()
         {
-            Unsubscribe("/lol-champ-select/v1/session", _champSelectRecordingOnUpdate);
+            lcu.Unsubscribe("/lol-champ-select/v1/session", _champSelectRecordingOnUpdate);
 
             string filename;
 
@@ -80,24 +97,59 @@ namespace LOBBYN
             FileInfo fileinfo = new FileInfo(filename);
             fileinfo.Directory.Create(); // If the directory already exists, this method does nothing.
 
-            File.WriteAllText(filename, JsonConvert.SerializeObject(champSelectEventHistory));
+            File.WriteAllText(fileinfo.FullName, JsonConvert.SerializeObject(champSelectEventHistory));
 
-            log($"Champ select recording saved to {filename}");
+            lastSavedChampSelectFilepath = fileinfo.FullName;
 
-            lastChampSelectEnterTimestamp = null;
+            logger.log($"Champ select recording saved to {lastSavedChampSelectFilepath}");
         }
 
         private void CaptureCurrentLobby()
         {
-            HttpResponseMessage response = request(requestMethod.GET, "/lol-lobby/v2/lobby").Result;
+            HttpResponseMessage response = lcu.request(requestMethod.GET, "/lol-lobby/v2/lobby").Result;
             if (response == null || response.StatusCode != HttpStatusCode.OK)
             {
-                logError("Failed to capture current lobby");
+                logger.logError("Failed to capture current lobby");
                 return;
             }
             lastLobbyDetails = JsonConvert.DeserializeObject<Lobby>(response.Content.ReadAsStringAsync().Result);
             lastLobbyEnterTimestamp = DateTime.Now;
-            log(lastLobbyDetails.gameConfig.queueId.ToString(), false);
+            logger.log(lastLobbyDetails.gameConfig.queueId.ToString(), false);
+        }
+
+        public JObject onlyChangedKeys(JObject current, JObject previous)
+        {
+            if (previous == null) return current;
+
+            JObject changed = new JObject();
+
+            foreach (var kvp in current)
+            {
+                if (previous[kvp.Key] == null) // key only in current, add it
+                {
+                    changed.Add(kvp.Key, kvp.Value);
+                    continue;
+                }
+                else if (JToken.DeepEquals(kvp.Value, previous[kvp.Key])) continue; // key in both, but same value, 
+                else if (kvp.Value.Type == JTokenType.Object) changed.Add(kvp.Key, onlyChangedKeys((JObject)kvp.Value, (JObject)previous[kvp.Key])); // key in both, different value, both are objects, recursively check
+                else if (kvp.Value.Type == JTokenType.Array) // key in both, both are arrays, only leave new elements
+                {
+                    JArray currentArray = (JArray)kvp.Value;
+                    JArray previousArray = (JArray)previous[kvp.Key];
+
+                    JArray newArray = new JArray();
+
+                    foreach (JToken token in currentArray) // comparison using JToken.DeepEquals
+                    {
+                        if (!previousArray.Any(x => JToken.DeepEquals(x, token))) newArray.Add(token);
+                    }
+
+                    changed.Add(kvp.Key, newArray);
+                }
+                else changed.Add(kvp.Key, kvp.Value);
+            }
+
+            return changed;
         }
 
         public async Task CreateCustomLobby(int mapId = MapType.SUMMONERS_RIFT, string lobbyName = "Lobbyn Custom Game", Int16 teamSize = 5, string password = "", string pickType = PickType.TOURNAMENT, string spectatorPolicy = SpectatorPolicy.ALL)
@@ -161,22 +213,22 @@ namespace LOBBYN
                 isCustom = true,
             };
 
-            HttpResponseMessage response = await request(requestMethod.POST, "/lol-lobby/v2/lobby", data);
+            HttpResponseMessage response = await lcu.request(requestMethod.POST, "/lol-lobby/v2/lobby", data);
 
             if (response == null || response.StatusCode != HttpStatusCode.OK)
             {
-                logError($"Failed to create lobby \"{lobbyName}\" {gamemode} {pickType} {spectatorPolicy}");
+                logger.logError($"Failed to create lobby \"{lobbyName}\" {gamemode} {pickType} {spectatorPolicy}");
             }
             else
             {
-                log($"Created lobby \"{lobbyName}\" {gamemode} {pickType} {spectatorPolicy}");
+                logger.log($"Created lobby \"{lobbyName}\" {gamemode} {pickType} {spectatorPolicy}");
             }
         }
 
         public async Task InvitePlayers(List<Tuple<string, string>> names)
         {
 
-            List<Summoner> summoners = await GetSummoners(names);
+            List<Summoner> summoners = await lcu.GetSummoners(names);
 
 
             List<object> data = new List<object>();
@@ -190,7 +242,7 @@ namespace LOBBYN
                 });
             }
 
-            await request(requestMethod.POST, "/lol-lobby/v2/lobby/invitations", data);
+            await lcu.request(requestMethod.POST, "/lol-lobby/v2/lobby/invitations", data);
         }
 
         public async Task InvitePlayer(string name, string tagline)
@@ -201,7 +253,9 @@ namespace LOBBYN
 
     internal class LOBBYNconfig
     {
-        public LeagueClientConfig lcuConfig = new LeagueClientConfig();
+        public int obsWebsocketPort = 4455;
+        public string obsWebsocketPassword = null;
+
         public string champSelectRecordingPath = "/champSelects";
     }
 

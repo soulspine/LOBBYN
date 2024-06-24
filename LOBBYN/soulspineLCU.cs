@@ -9,16 +9,15 @@ using Newtonsoft.Json.Linq;
 using WebSocketSharp;
 using System.Security.Authentication;
 using System.Net.Http;
-using System.IO;
 using System.Threading;
 using System.Collections.Concurrent;
 
-namespace soulspineLCU
+namespace soulspine.LCU
 {
     // THIS CLASS WAS CREATED TO PROPERLY HANDLE CONNECTIONS AND DISCONNECTIONS TO THE LEAGUE CLIENT
     // HEAVILY INSPIRED BY https://github.com/Ponita0/PoniLCU BUT FUNDAMENTALLY MODIFIED
     // https://github.com/Ponita0/PoniLCU/issues/19
-    public class LeagueClient
+    internal class LeagueClient
     {
         // process 
         private int? lcuPort = null;
@@ -27,7 +26,7 @@ namespace soulspineLCU
         private bool lcuProcessRunning;
 
         // config
-        public LeagueClientConfig config { get; private set; }
+        public bool autoReconnect { get; set; } = true;
 
         // http and websocket
         private HttpClient client = new HttpClient(new HttpClientHandler()
@@ -53,22 +52,22 @@ namespace soulspineLCU
         public event Action OnGameLeave = null;
 
         // status
-        public bool isConnected { get; private set; }
-        public bool isInLobby { get; private set; }
-        public bool isInChampSelect { get; private set; }
-        public bool isInGame { get; private set; }
+        private bool tryingToConnect = false;
+
+        public bool isConnected { get; private set; } = false;
+        public bool isInLobby { get; private set; } = false;
+        public bool isInChampSelect { get; private set; } = false;
+        public bool isInGame { get; private set; } = false;
 
         public Summoner localSummoner { get; private set; }
         public string localSummonerRegion { get; private set; }
 
-        public LeagueClient(LeagueClientConfig config = null)
-        {
-            if (config == null)
-            {
-                config = new LeagueClientConfig();
-            }
 
-            this.config = config;
+        public LeagueClient(bool autoReconnect = true)
+        {
+            this.autoReconnect = autoReconnect;
+
+            if (autoReconnect) Connect();
         }
 
         //handles are the only things allowed to use .Result instead of await
@@ -78,32 +77,30 @@ namespace soulspineLCU
         {
             if (isConnected)
             {
-                logError("Tried to connect to LCU, but it is already connected.");
-                return;
+                throw new InvalidOperationException("Tried to connect to LCU, but it is already connected.");
             }
-            handleConnection();
+            else if (tryingToConnect)
+            {
+                throw new InvalidOperationException("Tried invoking Connect() when there already was an ongoing attempt to connect. Perhaps try changing autoReconnect option when initializing a LeagueClass object.");
+            }
+            tryingToConnect = true;
+            Task.Run(() => handleConnection());
         }
 
         public void Disconnect()
         {
             if (!isConnected)
             {
-                logError("Tried to disconnect from LCU, but it is not connected.");
-                return;
+                throw new InvalidOperationException("Tried to disconnect from LCU, but it is not connected.");
             }
             handleDisconnection(true);
         }
 
         private void handleConnection()
         {
-            if (!(lcuProcessRunning = isProcessRunning("LeagueClientUx")))
-            {
-                logError("League of Legends is not running, waiting for it to start...", false);
-            }
+            RESTART:
 
-        RESTART:
-
-            while (!lcuProcessRunning)
+            while (!(lcuProcessRunning = isProcessRunning("LeagueClientUx")))
             {
                 Thread.Sleep(2000);
                 lcuProcessRunning = isProcessRunning("LeagueClientUx");
@@ -169,7 +166,6 @@ namespace soulspineLCU
 
             if (gameflowResponse == null || gameflowResponse.StatusCode != HttpStatusCode.OK)
             {
-                logError("Failed to get gameflow phase at startup.");
                 gameflowEventProc("None");
             }
             else
@@ -181,8 +177,9 @@ namespace soulspineLCU
             localSummoner = getLocalSummonerFromLCU().Result;
             localSummonerRegion = getSummonerRegionFromLCU(localSummoner).Result;
 
-            log($"Connected to the LCU API. Logged in as {localSummoner.gameName}#{localSummoner.tagLine} - {localSummonerRegion}");
             OnConnected?.Invoke();
+
+            tryingToConnect = false;
         }
 
         private void handleDisconnection(bool byExit = false)
@@ -208,9 +205,7 @@ namespace soulspineLCU
 
             OnDisconnected?.Invoke();
 
-            log("Disconnected from LCU API");
-
-            if (config.autoReconnect) handleConnection();
+            if (autoReconnect) Task.Run(() => handleConnection());
         }
 
         private string _websocketEventFromEndpoint(string endpoint)
@@ -233,7 +228,6 @@ namespace soulspineLCU
 
             if (eventKey != "OnJsonApiEvent")
             {
-                logError($"Received unknown event key: {eventKey}");
                 return;
             }
 
@@ -322,7 +316,6 @@ namespace soulspineLCU
 
         private void handleWebsocketDisconnection(object sender, CloseEventArgs e)
         {
-            log("Websocket connection closed.", false);
             handleDisconnection();
         }
 
@@ -333,19 +326,14 @@ namespace soulspineLCU
                 switch (opcode)
                 {
                     case 5:
-                        logError($"Tried to subscribe to {endpoint}, but LCU is not connected.");
-                        break;
+                        throw new InvalidOperationException($"Tried to subscribe to {endpoint}, but LCU is not connected.");
 
                     case 6:
-                        logError($"Tried to unsubscribe from {endpoint}, but LCU is not connected.");
-                        break;
+                        throw new InvalidOperationException($"Tried to unsubscribe from {endpoint}, but LCU is not connected.");
 
                     default:
-                        logError($"Tried to send a message to {endpoint}, but LCU is not connected.");
-                        break;
+                        throw new InvalidOperationException($"Tried to send a message to {endpoint}, but LCU is not connected.");
                 }
-
-                return false;
             }
 
             if (!isKey) socketConnection.Send($"[{opcode}, \"{_websocketEventFromEndpoint(endpoint)}\"]");
@@ -385,8 +373,7 @@ namespace soulspineLCU
 
             if (!subscriptions.ContainsKey(endpoint))
             {
-                logError($"Tried to unsubscribe from {endpoint}, but there are no actions binded to it.");
-                return;
+                throw new InvalidOperationException($"Tried to unsubscribe from {endpoint}, but there are no actions binded to it.");
             }
 
             if (action == null)
@@ -397,7 +384,7 @@ namespace soulspineLCU
             {
                 if (!subscriptions[endpoint].Remove(action))
                 {
-                    logError($"Tried to unsubscribe {action.ToString()} from {endpoint}, but this action was not bound.");
+                    throw new InvalidOperationException($"Tried to unsubscribe {action.ToString()} from {endpoint}, but this action was not bound.");
                 }
                 else if (subscriptions[endpoint].Count == 0)
                 {
@@ -411,25 +398,7 @@ namespace soulspineLCU
             subscriptions.Clear();
         }
 
-        public void log(string message, bool toFile = true)
-        {
-            string dateSig = $"{DateTime.Now.ToString("[dd-MM-yyyy | HH:mm:ss]")}";
-            message = $"{dateSig} {message}";
-            Console.WriteLine(message);
-
-            if (!File.Exists(config.logfilePath)) File.Create(config.logfilePath).Close();
-
-            if (!toFile && !config.logEverything) return;
-
-            var sw = new StreamWriter(File.Open(config.logfilePath, FileMode.Append));
-            sw.Write($"{message}\n");
-            sw.Close();
-        }
-
-        public void logError(string message, bool toFile = true)
-        {
-            log($"[ERROR] {message}", toFile);
-        }
+        
 
         private bool isProcessRunning(string processName)
         {
@@ -475,7 +444,7 @@ namespace soulspineLCU
             return outputList;
         }
 
-        private string base64Encode(string plainText)
+        private static string base64Encode(string plainText)
         {
             var plainTextBytes = System.Text.Encoding.UTF8.GetBytes(plainText);
             return System.Convert.ToBase64String(plainTextBytes);
@@ -485,8 +454,7 @@ namespace soulspineLCU
         {
             if (!ignoreReadyCheck && !isConnected)
             {
-                logError($"Tried to request {endpoint}, but LCU is not connected yet.");
-                return null;
+                throw new InvalidOperationException($"Tried to request {endpoint}, but LCU is not connected yet.");
             }
 
             if (endpoint.StartsWith("/")) endpoint = endpoint.Substring(1);
@@ -513,7 +481,7 @@ namespace soulspineLCU
             }
             catch (Exception e)
             {
-                if (!ignoreReadyCheck) logError($"Failed to send request to {endpoint}. - {e.Message}");
+                if (!ignoreReadyCheck) throw new HttpRequestException($"Failed to send request to {endpoint}. - {e.Message}");
                 return null;
             }
         }
@@ -556,8 +524,7 @@ namespace soulspineLCU
 
                 foreach (string n in names) v += $" {n}";
 
-                logError($"Failed to get summoner data for: [{v.Substring(1)}]");
-                return null;
+                throw new HttpRequestException($"Failed to get summoner data for: [{v.Substring(1)}]");
             }
             else
             {
@@ -581,8 +548,7 @@ namespace soulspineLCU
 
             if (response == null || response.StatusCode != HttpStatusCode.OK)
             {
-                logError("Failed to get local summoner data.");
-                return null;
+                throw new HttpRequestException("Failed to get local summoner data.");
             }
             else
             {
@@ -596,8 +562,7 @@ namespace soulspineLCU
 
             if (response == null || response.StatusCode != HttpStatusCode.OK)
             {
-                logError("Failed to get region locale.");
-                return null;
+                throw new HttpRequestException("Failed to get region locale.");
             }
             else
             {
@@ -608,12 +573,12 @@ namespace soulspineLCU
         }
     }
 
-    public enum requestMethod
+    internal enum requestMethod
     {
         GET, POST, PATCH, DELETE, PUT
     }
 
-    public enum QueueID
+    internal enum QueueID
     {
         CUSTOM = -1,
         QUICKPLAY = 490,
@@ -624,15 +589,7 @@ namespace soulspineLCU
         ARENA = 1700,
     }
 
-    public class LeagueClientConfig
-    {
-        public bool autoReconnect = false;
-        public bool logToFile = true;
-        public bool logEverything = false; 
-        public string logfilePath = "soulspineLCU.log";
-    }
-
-    public class OnWebsocketEventArgs : EventArgs
+    internal class OnWebsocketEventArgs : EventArgs
     {   // URI    
         public string Endpoint { get; set; }
 
@@ -643,7 +600,7 @@ namespace soulspineLCU
         public dynamic Data { get; set; }
     }
 
-    public class RerollPoints
+    internal class RerollPoints
     {
         public int currentPoints { get; set; }
         public int maxRolls { get; set; }
@@ -652,7 +609,7 @@ namespace soulspineLCU
         public int pointsToReroll { get; set; }
     }
 
-    public class Summoner
+    internal class Summoner
     {
         public Int64 accountId { get; set; }
         public string displayName { get; set; }
