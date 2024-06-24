@@ -81,7 +81,7 @@ namespace soulspine.LCU
             }
             else if (tryingToConnect)
             {
-                throw new InvalidOperationException("Tried invoking Connect() when there already was an ongoing attempt to connect. Perhaps try changing autoReconnect option when initializing a LeagueClass object.");
+                throw new InvalidOperationException("Tried invoking Connect() when there already was an ongoing attempt to connect. Perhaps try changing autoReconnect option when initializing a LeagueClient object.");
             }
             tryingToConnect = true;
             Task.Run(() => handleConnection());
